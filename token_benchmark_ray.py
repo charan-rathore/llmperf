@@ -68,9 +68,9 @@ def get_token_throughput_latencies(
     if not additional_sampling_params:
         additional_sampling_params = {}
 
-    completed_requests_lock = threading.Lock()
+    request_lock = threading.Lock()
     completed_requests = []
-    num_completed_requests = 0
+    next_request_index = 0
     # make up prompts outside of send loop for faster benchmarking loop
     num_output_tokens_list = []
     prompts = []
@@ -89,16 +89,20 @@ def get_token_throughput_latencies(
     start_time = time.monotonic()
     pbar = tqdm(total=max_num_completed_requests)
 
-    def launch_request(thread_index):
-        nonlocal num_completed_requests
+    def launch_request():
+        nonlocal next_request_index
         clients = construct_clients(llm_api=llm_api, num_clients=1)
         req_launcher = RequestsLauncher(clients)
-        request_index = thread_index % max_num_completed_requests
 
-        while (
-            time.monotonic() - start_time < test_timeout_s
-            and num_completed_requests < max_num_completed_requests
-        ):
+        while True:
+            with request_lock:
+                if (
+                    next_request_index >= max_num_completed_requests
+                    or time.monotonic() - start_time >= test_timeout_s
+                ):
+                    return
+                request_index = next_request_index
+                next_request_index += 1
 
             default_sampling_params = {"max_tokens": num_output_tokens_list[request_index] }
             default_sampling_params.update(additional_sampling_params)
@@ -111,28 +115,22 @@ def get_token_throughput_latencies(
             req_launcher.launch_requests(request_config)
 
             outs = req_launcher.get_next_ready()
-            all_metrics = []
-            for out in outs:
-                request_metrics, gen_text, _ = out
+            for request_metrics, gen_text, _ in outs:
                 num_output_tokens = get_token_length(gen_text)
-                with completed_requests_lock:
-                    if num_completed_requests < max_num_completed_requests:
-                        if num_output_tokens:
-                            request_metrics[common_metrics.INTER_TOKEN_LAT] /= request_metrics[common_metrics.NUM_OUTPUT_TOKENS]
-                        else:
-                            request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
-                        request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
-                        request_metrics[common_metrics.NUM_TOTAL_TOKENS] = request_metrics[common_metrics.NUM_INPUT_TOKENS] + num_output_tokens
-                        request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
-                        all_metrics.append(request_metrics)
-                        completed_requests.extend(all_metrics)
-                        pbar.update(len(all_metrics))
-                        num_completed_requests += len(all_metrics)
-                        request_index = (request_index + num_concurrent_requests) % max_num_completed_requests
+                if num_output_tokens:
+                    request_metrics[common_metrics.INTER_TOKEN_LAT] /= request_metrics[common_metrics.NUM_OUTPUT_TOKENS]
+                else:
+                    request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
+                request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
+                request_metrics[common_metrics.NUM_TOTAL_TOKENS] = request_metrics[common_metrics.NUM_INPUT_TOKENS] + num_output_tokens
+                request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
+                with request_lock:
+                    completed_requests.append(request_metrics)
+                    pbar.update(1)
 
     threads = []
-    for i in range(num_concurrent_requests):
-        thread = threading.Thread(target=launch_request, args=(i,))
+    for _ in range(min(num_concurrent_requests, max_num_completed_requests)):
+        thread = threading.Thread(target=launch_request)
         threads.append(thread)
         thread.start()
 
@@ -143,25 +141,6 @@ def get_token_throughput_latencies(
     end_time = time.monotonic()
     if end_time - start_time >= test_timeout_s:
         print("Test timed out before all requests could be completed.")
-
-    # check one last time that there are no remaining results to collect.
-    clients = construct_clients(llm_api=llm_api, num_clients=1)
-    req_launcher = RequestsLauncher(clients)
-    outs = req_launcher.get_next_ready()
-    all_metrics = []
-    for out in outs:
-        request_metrics, gen_text, _ = out
-        num_output_tokens = get_token_length(gen_text)
-        with completed_requests_lock:
-            if num_completed_requests < max_num_completed_requests:
-                if num_output_tokens:
-                    request_metrics[common_metrics.INTER_TOKEN_LAT] /= num_output_tokens
-                else:
-                    request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
-                request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
-                request_metrics[common_metrics.NUM_TOTAL_TOKENS] = request_metrics[common_metrics.NUM_INPUT_TOKENS] + num_output_tokens
-                request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
-                completed_requests.extend(request_metrics)
 
     print(f"\Results for token benchmark for {model} queried with the {llm_api} api.\n")
     ret = metrics_summary(completed_requests, start_time, end_time)
